@@ -59,6 +59,9 @@ env.bak/
 venv.bak/
 guardian-env/
 
+# Personal files
+personal_docs/
+
 # IDEs
 .idea/
 .vscode/
