@@ -68,3 +68,10 @@ personal_docs/
 
 # Mac
 .DS_Store
+
+# Local PoC Files
+*.db
+*-shm
+*-wal
+local-cluster-logs/
+execution_payload.json
