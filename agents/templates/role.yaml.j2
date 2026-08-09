@@ -1,0 +1,11 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ role_name }}
+  namespace: {{ namespace }}
+rules:
+{% for rule in rules %}
+- apiGroups: ["{{ rule.api_group }}"]
+  resources: ["{{ rule.resource }}"]
+  verbs: ["{{ rule.verb }}"]
+{% endfor %}

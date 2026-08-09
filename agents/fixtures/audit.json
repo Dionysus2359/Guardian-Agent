@@ -1,0 +1,8 @@
+{
+  "service_account": "backup-controller-sa",
+  "namespace": "ops",
+  "time_window_analyzed": "72_hours",
+  "used_permissions": [
+    {"resource": "secrets", "verb": "get", "api_group": ""}
+  ]
+}
