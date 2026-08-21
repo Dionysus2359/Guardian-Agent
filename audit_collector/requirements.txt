@@ -1,0 +1,5 @@
+# The collector is standard-library-only by design (see spec section 26).
+# PyYAML is OPTIONAL: if present, static kube-apiserver manifest discovery
+# parses YAML properly; if absent, a dependency-free regex fallback is used.
+# Uncomment if you want the more robust manifest parse:
+# PyYAML>=6.0
