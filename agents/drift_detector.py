@@ -1,100 +1,149 @@
+"""
+Permission Gap / Drift Detector
+
+USAGE:
+    python agents/drift_detector.py --audit <path_to_audit_json> --yaml <path_to_rbac_yaml>
+
+EXAMPLE (using defaults):
+    python agents/drift_detector.py --audit guardian_audit.json --yaml k8s/target_setup.yaml
+
+OUTPUT:
+    Generates 'drift_report.txt' (for humans) and 'drift_report.json' (for Streamlit dashboard)
+"""
+
+import argparse
 import json
 import yaml
-from kubernetes import client, config
-from agents.db import get_active_baseline, canonical_hash, insert_approval_queue_entry
+import sys
+from datetime import datetime, timezone
+import os
 
-def get_live_role(namespace: str, role_name: str):
-    config.load_kube_config()
-    v1 = client.RbacAuthorizationV1Api()
+def load_yaml_roles(yaml_path):
+    granted = set()
     try:
-        role = v1.read_namespaced_role(name=role_name, namespace=namespace)
-        return role
-    except client.ApiException as e:
-        print(f"Error reading live role: {e}")
-        return None
+        with open(yaml_path, 'r') as f:
+            docs = yaml.safe_load_all(f)
+            for doc in docs:
+                if not doc:
+                    continue
+                kind = doc.get("kind")
+                if kind in ("Role", "ClusterRole"):
+                    rules = doc.get("rules", [])
+                    for rule in rules:
+                        api_groups = rule.get("apiGroups", [""])
+                        resources = rule.get("resources", [])
+                        verbs = rule.get("verbs", [])
+                        
+                        for ag in api_groups:
+                            for res in resources:
+                                for v in verbs:
+                                    # store as a tuple (apiGroup, resource, verb)
+                                    granted.add((ag, res, v))
+    except Exception as e:
+        print(f"Error loading YAML {yaml_path}: {e}")
+    return granted
+
+def load_audit_json(audit_path):
+    try:
+        with open(audit_path, 'r') as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"Error loading Audit JSON {audit_path}: {e}")
+        return {}
 
 def main():
-    sa_name = "backup-controller-sa"
-    ns = "ops"
-    role_name = "backup-controller-role"
+    parser = argparse.ArgumentParser(description="Permission Gap / Drift Detector")
+    parser.add_argument("--audit", type=str, default="guardian_audit.json", help="Path to guardian_audit.json (used permissions)")
+    parser.add_argument("--yaml", type=str, default="k8s/target_setup.yaml", help="Path to RBAC YAML file (granted permissions)")
+    parser.add_argument("--output", type=str, default="drift_report", help="Prefix for output files (e.g. drift_report)")
     
-    print(f"Checking for drift on SA '{sa_name}' in namespace '{ns}'...")
+    args = parser.parse_args()
     
-    # Get active baseline
-    baseline = get_active_baseline(sa_name, ns)
-    if not baseline:
-        print("No ACTIVE baseline found in database. Nothing to compare against.")
-        return
+    if not os.path.exists(args.yaml):
+        print(f"Warning: {args.yaml} not found.")
+    if not os.path.exists(args.audit):
+        print(f"Warning: {args.audit} not found.")
         
-    baseline_hash = baseline["canonical_hash"]
+    granted_perms = load_yaml_roles(args.yaml)
+    audit_data = load_audit_json(args.audit)
     
-    # Get live role
-    live_role = get_live_role(ns, role_name)
-    if not live_role:
-        return
-        
-    # Extract rules and format to match our schema
-    live_rules = []
-    if live_role.rules:
-        for r in live_role.rules:
-            for res in (r.resources or []):
-                for v in (r.verbs or []):
-                    for ag in (r.api_groups or [""]):
-                        live_rules.append({
-                            "resource": res,
-                            "verb": v,
-                            "api_group": ag
-                        })
-                        
-    live_hash = canonical_hash(live_rules)
+    reports = []
     
-    if live_hash == baseline_hash:
-        print("✅ No drift detected. Live cluster matches approved baseline.")
-    else:
-        print("❌ DRIFT DETECTED!")
-        print(f"  Live hash:     {live_hash}")
-        print(f"  Baseline hash: {baseline_hash}")
-        print("\nAuto-reverting to approved baseline...")
-        
-        # Apply approved_yaml back to cluster
-        import tempfile
-        import os
-        from kubernetes import utils
-        
-        fd, path = tempfile.mkstemp()
-        try:
-            with os.fdopen(fd, 'w') as tmp:
-                tmp.write(baseline["approved_yaml"])
-                
-            config.load_kube_config()
-            k8s_client = client.ApiClient()
+    service_accounts = audit_data.get("service_accounts", [])
+    if not service_accounts:
+        # Fallback if a single SA object is passed instead of the expected list wrapper
+        if "service_account" in audit_data:
+            service_accounts = [audit_data]
+        else:
+            print("No service accounts found in audit data.")
             
-            # Delete first to ensure clean state, or use patch (but apply is easier via utils)
-            v1 = client.RbacAuthorizationV1Api()
-            try:
-                v1.patch_namespaced_role(
-                    name=role_name, 
-                    namespace=ns, 
-                    body=yaml.safe_load(baseline["approved_yaml"])
-                )
-                print("✅ Successfully reverted role to baseline.")
-            except Exception as e:
-                print(f"Failed to auto-revert: {e}")
-                
-        finally:
-            os.remove(path)
+    for sa_entry in service_accounts:
+        sa_name = sa_entry.get("service_account", "unknown")
+        ns = sa_entry.get("namespace", "unknown")
+        
+        used_perms = set()
+        
+        if "permissions_used" in sa_entry:
+            for p in sa_entry["permissions_used"]:
+                ag = p.get("api_group", "")
+                res = p.get("resource", "")
+                verb = p.get("verb", "")
+                used_perms.add((ag, res, verb))
+        
+        granted_but_unused = granted_perms - used_perms
+        used_and_granted = used_perms & granted_perms
+        used_but_not_granted = used_perms - granted_perms
+        
+        report = {
+            "service_account": sa_name,
+            "namespace": ns,
+            "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "granted_but_unused": [{"api_group": g[0], "resource": g[1], "verb": g[2]} for g in sorted(granted_but_unused)],
+            "used_and_granted": [{"api_group": g[0], "resource": g[1], "verb": g[2]} for g in sorted(used_and_granted)],
+            "used_but_not_granted": [{"api_group": g[0], "resource": g[1], "verb": g[2]} for g in sorted(used_but_not_granted)]
+        }
+        reports.append(report)
+        
+        # Generate Text Report
+        txt_path = f"{args.output}.txt"
+        with open(txt_path, "w") as f:
+            f.write("=== Permission Gap Report ===\n")
+            f.write(f"Service Account: {sa_name}\n")
+            f.write(f"Namespace: {ns}\n")
+            f.write(f"Generated: {report['timestamp']}\n\n")
             
-        # Check if dangerous verbs were added
-        dangerous_verbs = {"bind", "impersonate", "escalate", "approve"}
-        risk_tier = "low"
-        for rule in live_rules:
-            if rule["verb"] in dangerous_verbs:
-                risk_tier = "critical"
-                break
-                
-        # Log to approval queue
-        insert_approval_queue_entry(baseline["id"], "drift_reverted", risk_tier)
-        print(f"Created PENDING_APPROVAL entry in queue with risk tier: {risk_tier}")
+            f.write("--- GRANTED BUT UNUSED (potential over-privilege) ---\n")
+            if not granted_but_unused:
+                f.write("  (none)\n")
+            for p in sorted(granted_but_unused):
+                ag = p[0] if p[0] else "core"
+                f.write(f"  • {p[1]} / {p[2]} ({ag})\n")
+            f.write("\n")
+            
+            f.write("--- USED AND GRANTED (confirmed necessary) ---\n")
+            if not used_and_granted:
+                f.write("  (none)\n")
+            for p in sorted(used_and_granted):
+                ag = p[0] if p[0] else "core"
+                f.write(f"  • {p[1]} / {p[2]} ({ag})\n")
+            f.write("\n")
+            
+            f.write("--- USED BUT NOT GRANTED (anomaly) ---\n")
+            if not used_but_not_granted:
+                f.write("  (none)\n")
+            for p in sorted(used_but_not_granted):
+                ag = p[0] if p[0] else "core"
+                f.write(f"  • {p[1]} / {p[2]} ({ag})\n")
+            f.write("\n")
+            
+            total_granted = len(granted_perms)
+            f.write(f"Summary: {len(granted_but_unused)} unused permissions found out of {total_granted} total granted.\n")
+            print(f"Generated text report at {txt_path}")
+            
+    json_path = f"{args.output}.json"
+    with open(json_path, "w") as f:
+        json.dump(reports, f, indent=2)
+        print(f"Generated JSON report at {json_path}")
 
 if __name__ == "__main__":
     main()
